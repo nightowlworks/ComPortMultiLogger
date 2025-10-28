@@ -73,8 +73,14 @@ public static class Defaults
     // Reconnect idle threshold (seconds). App waits at least this long without frames before reconnect.
     public const int ReconnectIdleSeconds = 20;
 
-    // Cooldown between reconnect requests per logger (seconds) to avoid reconnect storms.
+    // Polling interval for ensure-open loop (milliseconds)
+    public const int EnsurePollMs = 2000;
+
+    // Cooldown between explicit reconnect requests per logger (seconds)
     public const int ReconnectRequestCooldownSeconds = 5;
+
+    // After opening the port, give the device a grace period to boot before we consider it idle
+    public const int PostOpenGraceSeconds = 15;
 
     // Fallback white PNG (64x64) as Base64 if Assets\logo.png is missing.
     public const string LogoBase64 =
@@ -341,12 +347,11 @@ public sealed class MainForm : Form
         headerPanel.Controls.Add(headerLeft);
         headerPanel.Controls.Add(headerRight);
 
-        // ===== Loggers ListView — minimal columns (no ID, no Rate)
+        // ===== Loggers ListView — remove "Letzter Fehler" column; keep: Port, Ordner, Status, Age
         lv.Columns.Add("Port", 120);             // 0
-        lv.Columns.Add("Ordner", 700);           // 1
-        lv.Columns.Add("Status", 260);           // 2
-        lv.Columns.Add("Letzter Fehler", 360);   // 3
-        lv.Columns.Add("Age", 80);               // 4
+        lv.Columns.Add("Ordner", 760);           // 1
+        lv.Columns.Add("Status", 360);           // 2
+        lv.Columns.Add("Age", 80);               // 3
         TryEnableDoubleBuffer(lv);
 
         // Split container
@@ -481,17 +486,12 @@ public sealed class MainForm : Form
                 cmbPorts.Items.AddRange(now);
                 if (cmbPorts.Items.Count > 0 && cmbPorts.SelectedIndex < 0) cmbPorts.SelectedIndex = 0;
 
-                // nudge running loggers only when state changed for their port
+                // tell running loggers to ensure/open soon
                 foreach (ListViewItem it in lv.Items)
                 {
-                    if (it.Tag is ComLogger lg && lg.IsRunning)
+                    if (it.Tag is ComLogger lg && lg.WantsRunning)
                     {
-                        bool existsNow = now.Contains(lg.Config.PortName, StringComparer.OrdinalIgnoreCase);
-                        bool existedBefore = before.Contains(lg.Config.PortName, StringComparer.OrdinalIgnoreCase);
-                        if (existsNow != existedBefore)
-                        {
-                            lg.RequestReconnect(existsNow ? "device_arrival" : "device_removed");
-                        }
+                        lg.NudgeEnsure("device_change");
                     }
                 }
             }
@@ -624,9 +624,8 @@ public sealed class MainForm : Form
             AutoRebind = true
         };
 
-        var logger = new ComLogger(port, cfg); // use port as Id now
+        var logger = new ComLogger(port, cfg); // use port as Id
         logger.StatusChanged += OnLoggerStatus;
-        logger.MetricsUpdated += OnLoggerMetrics;
         logger.LiveRow += OnLoggerLiveRow;
 
         loggers[port] = logger;
@@ -634,7 +633,7 @@ public sealed class MainForm : Form
         var item = new ListViewItem(new[]
         {
             cfg.PortName, cfg.FolderPath,
-            simulated ? "Simuliert (gestoppt)" : "Gestoppt", "-", "-"
+            simulated ? "Simuliert (gestoppt)" : "Gestoppt", "-"
         })
         { Name = port, Tag = logger, UseItemStyleForSubItems = false };
 
@@ -732,20 +731,20 @@ public sealed class MainForm : Form
             {
                 if (it.Tag is not ComLogger lg) continue;
 
-                // update Age column (index 4)
+                // update Age column (index 3)
                 double ageSec = lg.LastFrameUtc == DateTime.MinValue ? double.NaN
                     : (DateTime.UtcNow - lg.LastFrameUtc).TotalSeconds;
 
-                it.SubItems[4].Text = double.IsNaN(ageSec) ? "-" : $"{ageSec:0.0}s";
+                it.SubItems[3].Text = double.IsNaN(ageSec) ? "-" : $"{ageSec:0.0}s";
 
-                // If running and idle ≥ threshold → request reconnect (throttled inside logger)
-                if (lg.IsRunning && (!double.IsNaN(ageSec) && ageSec >= Defaults.ReconnectIdleSeconds))
+                // If running and idle ≥ threshold → nudge ensure loop (it will reopen with grace)
+                if (lg.WantsRunning && (!double.IsNaN(ageSec) && ageSec >= Defaults.ReconnectIdleSeconds))
                 {
                     var sub = it.SubItems[2]; // Status column
                     sub.ForeColor = Color.DarkOrange;
                     sub.Font = new Font(lv.Font, FontStyle.Bold);
                     sub.Text = "Reconnect …";
-                    lg.RequestReconnect("watchdog_idle");
+                    lg.NudgeEnsure("watchdog_idle");
                 }
             }
         }
@@ -763,13 +762,8 @@ public sealed class MainForm : Form
             if (!lv.Items.ContainsKey(e.Id)) return; // Id == Port
             var it = lv.Items[e.Id];
             it.SubItems[2].Text = e.StatusText; // Status
-            it.SubItems[3].Text = string.IsNullOrEmpty(e.LastError) ? "-" : e.LastError; // LastError
 
-            if (!string.IsNullOrWhiteSpace(e.LastError))
-                _loggersWithError.Add(e.Id);
-            else
-                _loggersWithError.Remove(e.Id);
-            _wantErrorUi = _loggersWithError.Count > 0;
+            _wantErrorUi = _loggersWithError.Count > 0; // keep global logic minimal
 
             if (it.Tag is ComLogger logger)
             {
@@ -789,11 +783,6 @@ public sealed class MainForm : Form
             slState.Text = e.StatusText;
             UpdateButtons();
         }));
-    }
-
-    private void OnLoggerMetrics(object? sender, LoggerMetrics e)
-    {
-        // rate column removed – no-op
     }
 
     private void OnLoggerLiveRow(object? sender, LoggerLive e)
@@ -865,23 +854,6 @@ public sealed class MainForm : Form
         if (lv.SelectedItems.Count != 1) return;
         if (lv.SelectedItems[0].Tag is not ComLogger logger) return;
 
-        if (!logger.Config.Simulated)
-        {
-            // allow start even if port missing; reconnect loop will wait
-            if (!SerialPort.GetPortNames().Contains(logger.Config.PortName, StringComparer.OrdinalIgnoreCase))
-            {
-                slState.Text = $"Port {logger.Config.PortName} nicht vorhanden – warte auf Gerät …";
-                logger.RequestReconnect("start_missing");
-                return;
-            }
-            if (loggers.Values.Any(l => !ReferenceEquals(l, logger) && l.IsRunning &&
-                string.Equals(l.Config.PortName, logger.Config.PortName, StringComparison.OrdinalIgnoreCase)))
-            {
-                slState.Text = $"Port {logger.Config.PortName} wird bereits verwendet";
-                return;
-            }
-        }
-
         _ = logger.StartAsync();
     }
 
@@ -903,8 +875,6 @@ public sealed class MainForm : Form
             logger.Dispose();
             loggers.Remove(id);
             lv.Items.RemoveByKey(id);
-            _loggersWithError.Remove(id);
-            _wantErrorUi = _loggersWithError.Count > 0;
 
             // remove live row
             if (_liveRowsByPort.TryGetValue(id, out var row))
@@ -941,10 +911,10 @@ public sealed class ComLogger : IDisposable
 {
     public LoggerConfig Config { get; }
     public bool IsRunning => _simTaskRunning || _serial?.IsOpen == true;
+    public bool WantsRunning => _desiredRunning;
 
     public event EventHandler<LoggerStatus>? StatusChanged;
     public event EventHandler<LoggerLines>? LinesUpdated;
-    public event EventHandler<LoggerMetrics>? MetricsUpdated;
     public event EventHandler<LoggerLive>? LiveRow;
 
     private SerialPort? _serial;
@@ -954,12 +924,14 @@ public sealed class ComLogger : IDisposable
     private readonly StringBuilder _buf = new();
     private string? _lastError;
     private CancellationTokenSource? _cts;
-    private int _reconnectAttempt;
-    private bool _reconnectLoopRunning;
-    private DateTime _nextReconnectAllowedUtc = DateTime.MinValue; // throttle
-    private readonly WinFormsTimer _rateTimer = new() { Interval = 1000 };
+    private bool _desiredRunning;
     private readonly WinFormsTimer _idleTimer = new() { Interval = Defaults.ReconnectIdleSeconds * 1000 }; // 20s idle
-    private int _linesThisSecond = 0;
+
+    // Ensure-open background loop
+    private CancellationTokenSource? _ensureCts;
+    private Task? _ensureTask;
+    private DateTime _graceUntilUtc = DateTime.MinValue;
+    private DateTime _nextReconnectAllowedUtc = DateTime.MinValue;
 
     // For simulation mode
     private Task? _simTask;
@@ -1001,9 +973,6 @@ public sealed class ComLogger : IDisposable
     // encoder for pure UTF-8 without BOM
     private static readonly UTF8Encoding Utf8NoBom = new UTF8Encoding(false);
 
-    // Jitter
-    private static readonly ThreadLocal<Random> _rnd = new(() => new Random(unchecked(Environment.TickCount * 31 + Thread.CurrentThread.ManagedThreadId)));
-
     public string Id { get; }
 
     public ComLogger(string id, LoggerConfig config)
@@ -1011,23 +980,20 @@ public sealed class ComLogger : IDisposable
         Id = id;                 // Id == Port name
         Config = config;
 
-        _rateTimer.Tick += (_, __) =>
-        {
-            int rate = Interlocked.Exchange(ref _linesThisSecond, 0);
-            MetricsUpdated?.Invoke(this, new LoggerMetrics(Id, rate));
-        };
-        _rateTimer.Start();
-
-        // Idle timer: if no frames for a while, try reconnect (20s)
+        // Idle timer: if no frames for a while, ask ensure-loop to reopen
         _idleTimer.Tick += (_, __) =>
         {
-            if (!IsRunning || Config.Simulated) return;
+            if (!WantsRunning || Config.Simulated) return;
+
+            // respect grace window after (re)open
+            if (DateTime.UtcNow < _graceUntilUtc) return;
+
             var last = LastFrameUtc;
             var age = last == DateTime.MinValue ? TimeSpan.MaxValue : DateTime.UtcNow - last;
             if (age.TotalSeconds >= Defaults.ReconnectIdleSeconds)
             {
-                AppLogger.Debug($"IdleTimer: no data for {age.TotalSeconds:0.0}s on {Config.PortName}, requesting reconnect");
-                RequestReconnect("idle_timer");
+                AppLogger.Debug($"IdleTimer: no data {age.TotalSeconds:0.0}s on {Config.PortName}, nudge ensure");
+                NudgeEnsure("idle_timer");
             }
         };
         _idleTimer.Start();
@@ -1035,52 +1001,28 @@ public sealed class ComLogger : IDisposable
 
     public async Task StartAsync()
     {
-        if (IsRunning) return;
+        if (_desiredRunning) return;
 
-        try
-        {
-            if (Config.Simulated)
-            {
-                StartSimulated();
-                RaiseStatus($"Läuft – {Config.PortName} (Sim).");
-                return;
-            }
+        _desiredRunning = true;
+        _cts ??= new CancellationTokenSource();
 
-            if (!SerialPort.GetPortNames().Contains(Config.PortName, StringComparer.OrdinalIgnoreCase))
-            {
-                RaiseStatus($"Port {Config.PortName} nicht vorhanden", "Port fehlt");
-                RequestReconnect("start_missing");
-                return;
-            }
+        if (Config.Simulated)
+        {
+            StartSimulated();
+            RaiseStatus($"Läuft – {Config.PortName} (Sim).");
+            return;
+        }
 
-            OpenSerial();
-            _cts ??= new CancellationTokenSource();
-            _reconnectAttempt = 0;
-            RaiseStatus($"Läuft – {Config.PortName} @ {Defaults.FixedBaud}.");
-        }
-        catch (UnauthorizedAccessException ex)
-        {
-            LogError("Start (Port belegt/kein Zugriff)", ex);
-            RaiseStatus("Start fehlgeschlagen (Zugriff verweigert). Reconnect …", ex.Message);
-            RequestReconnect("start_unauthorized");
-        }
-        catch (IOException ex)
-        {
-            LogError("Start (I/O)", ex);
-            RaiseStatus("Start fehlgeschlagen (I/O). Reconnect …", ex.Message);
-            RequestReconnect("start_io");
-        }
-        catch (Exception ex)
-        {
-            LogError("Start", ex);
-            RaiseStatus("Start fehlgeschlagen. Reconnect …", ex.Message);
-            RequestReconnect("start_other");
-        }
+        // Start ensure loop
+        StartEnsureLoop();
+
+        // Try initial open quickly; don't await the loop
+        _ = Task.Run(() => EnsureOpenOnceAsync("start"));
     }
 
     public void Stop()
     {
-        try { _cts?.Cancel(); _rateTimer.Stop(); } catch { }
+        _desiredRunning = false;
 
         if (Config.Simulated)
         {
@@ -1088,6 +1030,170 @@ public sealed class ComLogger : IDisposable
             try { _simTask?.Wait(200); } catch { }
         }
 
+        try
+        {
+            _ensureCts?.Cancel();
+            _ensureTask = null;
+        }
+        catch { }
+
+        SafeClose("stop");
+
+        RaiseStatus(Config.Simulated ? "Simuliert (gestoppt)." : "Gestoppt.");
+    }
+
+    public void Dispose() => Stop();
+
+    private void StartEnsureLoop()
+    {
+        if (_ensureTask != null && !_ensureTask.IsCompleted) return;
+
+        _ensureCts = new CancellationTokenSource();
+        var token = _ensureCts.Token;
+
+        _ensureTask = Task.Run(async () =>
+        {
+            AppLogger.Debug($"Ensure loop started for {Config.PortName}");
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    if (!_desiredRunning)
+                    {
+                        await Task.Delay(Defaults.EnsurePollMs, token);
+                        continue;
+                    }
+
+                    // If port is not open → try open when present (or rebind)
+                    if (!IsOpen())
+                    {
+                        await EnsureOpenOnceAsync("ensure_loop");
+                        await Task.Delay(Defaults.EnsurePollMs, token);
+                        continue;
+                    }
+
+                    // If open but no data for too long → close (ensure will reopen)
+                    if (DateTime.UtcNow >= _graceUntilUtc)
+                    {
+                        var last = LastFrameUtc;
+                        var age = last == DateTime.MinValue ? TimeSpan.MaxValue : DateTime.UtcNow - last;
+                        if (age.TotalSeconds >= Defaults.ReconnectIdleSeconds)
+                        {
+                            AppLogger.Debug($"Ensure: idle {age.TotalSeconds:0.0}s on {Config.PortName}, closing for reopen");
+                            SafeClose("ensure_idle");
+                        }
+                    }
+                }
+                catch (TaskCanceledException) { }
+                catch (Exception ex)
+                {
+                    AppLogger.LogException("EnsureLoop", ex);
+                }
+
+                try { await Task.Delay(Defaults.EnsurePollMs, token); } catch { }
+            }
+            AppLogger.Debug($"Ensure loop stopped for {Config.PortName}");
+        }, token);
+    }
+
+    private bool IsOpen()
+    {
+        lock (_serialLock) return _serial?.IsOpen == true;
+    }
+
+    public void NudgeEnsure(string reason)
+    {
+        AppLogger.Debug($"NudgeEnsure({reason}) for {Config.PortName}");
+        // Force immediate attempt by allowing next reconnect now
+        _nextReconnectAllowedUtc = DateTime.MinValue;
+        // If currently open, we let idle timer/ensure logic handle; if closed, ensure loop will try soon.
+    }
+
+    private async Task EnsureOpenOnceAsync(string reason)
+    {
+        try
+        {
+            if (!_desiredRunning) return;
+
+            var now = DateTime.UtcNow;
+            if (now < _nextReconnectAllowedUtc) return; // throttle explicit attempts
+            _nextReconnectAllowedUtc = now.AddSeconds(Defaults.ReconnectRequestCooldownSeconds);
+
+            var ports = SerialPort.GetPortNames();
+            string? target = null;
+
+            if (ports.Contains(Config.PortName, StringComparer.OrdinalIgnoreCase))
+            {
+                target = Config.PortName;
+            }
+            else if (Config.AutoRebind && ports.Length > 0)
+            {
+                // Heuristic: choose first available by name order
+                target = ports.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).First();
+                if (!string.Equals(target, Config.PortName, StringComparison.OrdinalIgnoreCase))
+                    AppLogger.Log($"AutoRebind: {Config.PortName} not found; trying {target}");
+            }
+
+            if (target == null)
+            {
+                AppLogger.Debug($"EnsureOpen: no suitable COM port yet for {Config.PortName}");
+                RaiseStatus($"Warte auf Gerät – {Config.PortName} …");
+                return;
+            }
+
+            // Try open
+            lock (_serialLock)
+            {
+                var sp = new SerialPort(target, Defaults.FixedBaud)
+                {
+                    Parity = Parity.None,
+                    DataBits = 8,
+                    StopBits = StopBits.One,
+                    Handshake = Handshake.None,
+                    ReadTimeout = 100,
+                    WriteTimeout = 500,
+                    NewLine = "\n",
+                    Encoding = Encoding.UTF8,
+                    DtrEnable = true,
+                    RtsEnable = true
+                };
+                sp.DataReceived += SerialOnDataReceived;
+                sp.ErrorReceived += SerialOnError;
+                sp.PinChanged += SerialOnPinChanged;
+                sp.Open();
+                sp.DiscardInBuffer();
+                sp.DiscardOutBuffer();
+                _serial = sp;
+            }
+
+            if (!string.Equals(target, Config.PortName, StringComparison.OrdinalIgnoreCase))
+                Config.PortName = target;
+
+            // After open, give Arduino time to boot (grace)
+            _graceUntilUtc = DateTime.UtcNow.AddSeconds(Defaults.PostOpenGraceSeconds);
+            LastFrameUtc = DateTime.UtcNow; // reset idle age
+            RaiseStatus($"Läuft – {Config.PortName} @ {Defaults.FixedBaud}.");
+            AppLogger.Log($"Serial opened: {Config.PortName} @ {Defaults.FixedBaud} (reason={reason})");
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            AppLogger.LogException("EnsureOpen(Unauthorized)", ex);
+            RaiseStatus("Port belegt/kein Zugriff – erneuter Versuch …");
+        }
+        catch (IOException ex)
+        {
+            AppLogger.LogException("EnsureOpen(IO)", ex);
+            RaiseStatus("I/O-Fehler – erneuter Versuch …");
+        }
+        catch (Exception ex)
+        {
+            AppLogger.LogException("EnsureOpen(Other)", ex);
+            RaiseStatus("Fehler beim Öffnen – erneuter Versuch …");
+        }
+    }
+
+    private void SafeClose(string reason)
+    {
         try
         {
             lock (_serialLock)
@@ -1102,48 +1208,20 @@ public sealed class ComLogger : IDisposable
                     _serial = null;
                 }
             }
+            RaiseStatus("Getrennt – Reconnect läuft …");
+            AppLogger.Log($"Serial closed ({reason}) on {Config.PortName}");
         }
-        catch { }
-
-        _reconnectLoopRunning = false;
-
-        RaiseStatus(Config.Simulated ? "Simuliert (gestoppt)." : "Gestoppt.");
-    }
-
-    public void Dispose() => Stop();
-
-    private void OpenSerial()
-    {
-        lock (_serialLock)
+        catch (Exception ex)
         {
-            if (_serial != null) return;
-
-            var sp = new SerialPort(Config.PortName, Defaults.FixedBaud)
-            {
-                Parity = Parity.None,
-                DataBits = 8,
-                StopBits = StopBits.One,
-                Handshake = Handshake.None,
-                ReadTimeout = 100,
-                WriteTimeout = 500,
-                NewLine = "\n",
-                Encoding = Encoding.UTF8,
-                DtrEnable = true,
-                RtsEnable = true
-            };
-            sp.DataReceived += SerialOnDataReceived;
-            sp.ErrorReceived += SerialOnError;
-            sp.PinChanged += SerialOnPinChanged;
-            sp.Open();
-            _serial = sp;
-            AppLogger.Log($"Serial opened: {Config.PortName} @ {Defaults.FixedBaud}");
+            AppLogger.LogException("SafeClose", ex);
         }
     }
 
     private void SerialOnError(object? s, SerialErrorReceivedEventArgs e)
     {
         AppLogger.Log($"Serial error on {Config.PortName}: {e.EventType}");
-        RequestReconnect("serial_error_" + e.EventType);
+        SafeClose("serial_error_" + e.EventType);
+        NudgeEnsure("serial_error");
     }
 
     private void SerialOnPinChanged(object? s, SerialPinChangedEventArgs e)
@@ -1152,129 +1230,9 @@ public sealed class ComLogger : IDisposable
         if (e.EventType == SerialPinChange.Break || e.EventType == SerialPinChange.CDChanged ||
             e.EventType == SerialPinChange.DsrChanged || e.EventType == SerialPinChange.CtsChanged)
         {
-            RequestReconnect("pin_change_" + e.EventType);
+            SafeClose("pin_change_" + e.EventType);
+            NudgeEnsure("pin_change");
         }
-    }
-
-    public void RequestReconnect(string reason)
-    {
-        // throttle reconnect requests so they don't fire too often/early
-        var nowUtc = DateTime.UtcNow;
-        if (nowUtc < _nextReconnectAllowedUtc)
-        {
-            AppLogger.Debug($"Reconnect suppressed (cooldown) on {Config.PortName}, reason={reason}");
-            return;
-        }
-        _nextReconnectAllowedUtc = nowUtc.AddSeconds(Defaults.ReconnectRequestCooldownSeconds);
-
-        if (_reconnectLoopRunning)
-        {
-            AppLogger.Debug($"Reconnect already running on {Config.PortName}, reason={reason}");
-            return;
-        }
-
-        _reconnectLoopRunning = true;
-        _cts ??= new CancellationTokenSource();
-
-        Task.Run(async () =>
-        {
-            try
-            {
-                AppLogger.Debug($"Reconnect loop begin: port={Config.PortName}, reason={reason}");
-                string? lastTried = null;
-
-                while (!_cts.IsCancellationRequested)
-                {
-                    try
-                    {
-                        // fully close
-                        lock (_serialLock)
-                        {
-                            if (_serial != null)
-                            {
-                                _serial.ErrorReceived -= SerialOnError;
-                                _serial.PinChanged -= SerialOnPinChanged;
-                                _serial.DataReceived -= SerialOnDataReceived;
-                                if (_serial.IsOpen) _serial.Close();
-                                _serial.Dispose();
-                                _serial = null;
-                            }
-                        }
-
-                        var ports = SerialPort.GetPortNames();
-                        string? target = null;
-
-                        if (ports.Contains(Config.PortName, StringComparer.OrdinalIgnoreCase))
-                        {
-                            target = Config.PortName;
-                        }
-                        else if (Config.AutoRebind && ports.Length > 0)
-                        {
-                            // Heuristic: choose first available by name order
-                            target = ports.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).First();
-                            if (!string.Equals(target, Config.PortName, StringComparison.OrdinalIgnoreCase))
-                                AppLogger.Log($"AutoRebind: {Config.PortName} not found; trying {target}");
-                        }
-
-                        if (target != null)
-                        {
-                            // Try open
-                            lock (_serialLock)
-                            {
-                                var sp = new SerialPort(target, Defaults.FixedBaud)
-                                {
-                                    Parity = Parity.None,
-                                    DataBits = 8,
-                                    StopBits = StopBits.One,
-                                    Handshake = Handshake.None,
-                                    ReadTimeout = 100,
-                                    WriteTimeout = 500,
-                                    NewLine = "\n",
-                                    Encoding = Encoding.UTF8,
-                                    DtrEnable = true,
-                                    RtsEnable = true
-                                };
-                                sp.DataReceived += SerialOnDataReceived;
-                                sp.ErrorReceived += SerialOnError;
-                                sp.PinChanged += SerialOnPinChanged;
-                                sp.Open();
-                                _serial = sp;
-                            }
-
-                            if (!string.Equals(target, Config.PortName, StringComparison.OrdinalIgnoreCase))
-                                Config.PortName = target; // rebind to new COM number
-
-                            _reconnectAttempt = 0;
-                            RaiseStatus($"Wieder verbunden – {Config.PortName} @ {Defaults.FixedBaud}.");
-                            AppLogger.Log($"Serial reopened: {Config.PortName}");
-                            _reconnectLoopRunning = false;
-                            return;
-                        }
-
-                        // Still no suitable port
-                        string joined = string.Join(",", ports);
-                        if (lastTried != joined)
-                        {
-                            AppLogger.Debug("Reconnect waiting: no suitable COM port yet. Available: " + joined);
-                            lastTried = joined;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        LogError("ReconnectLoopOpen", ex);
-                        RaiseStatus("Reconnect fehlgeschlagen.", ex.Message);
-                    }
-
-                    _reconnectAttempt++;
-                    int baseDelay = (int)Math.Min(30000, Math.Pow(2, Math.Min(6, _reconnectAttempt)) * 250);
-                    int jitter = _rnd.Value!.Next(-200, 200);
-                    int delay = Math.Max(500, baseDelay + jitter);
-                    await Task.Delay(delay, _cts.Token);
-                }
-            }
-            catch { }
-            finally { _reconnectLoopRunning = false; }
-        });
     }
 
     private void SerialOnDataReceived(object? sender, SerialDataReceivedEventArgs e)
@@ -1288,7 +1246,7 @@ public sealed class ComLogger : IDisposable
             var chunk = s.ReadExisting();
             if (string.IsNullOrEmpty(chunk)) return;
 
-            AppLogger.Debug($"DataReceived: chunk len={chunk.Length}, preview='{SafePreview(chunk)}'");
+            AppLogger.Debug($"DataReceived {Config.PortName}: len={chunk.Length}, preview='{SafePreview(chunk)}'");
 
             lock (_buf)
             {
@@ -1316,8 +1274,9 @@ public sealed class ComLogger : IDisposable
         }
         catch (Exception ex)
         {
-            LogError("DataReceived", ex);
-            RequestReconnect("data_received_exception");
+            AppLogger.LogException("DataReceived", ex);
+            SafeClose("data_received_exception");
+            NudgeEnsure("data_received_exception");
         }
     }
 
@@ -1364,7 +1323,7 @@ public sealed class ComLogger : IDisposable
             var m = FrameRegex.Match(candidate);
             if (!m.Success)
             {
-                AppLogger.Log($"Invalid frame format (len={candidate.Length}): '{SafePreview(candidate)}'");
+                AppLogger.Log($"Invalid frame format (len={candidate.Length}, port={Config.PortName}): '{SafePreview(candidate)}'");
                 continue;
             }
 
@@ -1384,19 +1343,17 @@ public sealed class ComLogger : IDisposable
 
             DateTime ts = DateTime.Now;
 
+            // mark activity
+            LastFrameUtc = DateTime.UtcNow;
+
             // Live + debug
             AppendToLive($"{ts:yyyy-MM-dd HH:mm:ss.fff} | RAW={candidate} | T= {fileLine}");
-            AppLogger.Debug($"Frame OK: port={Config.PortName}, temps={fileLine}, rawLen={candidate.Length}");
+            AppLogger.Debug($"Frame OK {Config.PortName}: temps={fileLine}, rawLen={candidate.Length}");
 
             LiveRow?.Invoke(this, new LoggerLive(Id, Config.PortName, ts, tempsFormatted, candidate));
 
             // Only keep last value in do_not_delete.txt (atomic)
-            WriteLastValueSafe(fileLine, out bool _);
-
-            // update watchdog timestamp even if file write failed
-            LastFrameUtc = DateTime.UtcNow;
-
-            Interlocked.Increment(ref _linesThisSecond);
+            WriteLastValueSafe(fileLine);
         }
     }
 
@@ -1414,9 +1371,8 @@ public sealed class ComLogger : IDisposable
     }
 
     // Disk guard + atomic replace with retries (UTF-8 without BOM)
-    private void WriteLastValueSafe(string fileLine, out bool diskOk)
+    private void WriteLastValueSafe(string fileLine)
     {
-        diskOk = true;
         try
         {
             string target = Config.OutputPath;
@@ -1428,9 +1384,8 @@ public sealed class ComLogger : IDisposable
                     var di = new DriveInfo(root);
                     if (di.AvailableFreeSpace < Defaults.MinFreeBytes)
                     {
-                        RaiseStatus("Wenig Speicher – Logging pausiert", "Freier Speicher < 200 MB");
+                        RaiseStatus("Wenig Speicher – Logging pausiert");
                         AppLogger.Log("Low disk space: logging paused");
-                        diskOk = false;
                         return;
                     }
                 }
@@ -1465,31 +1420,24 @@ public sealed class ComLogger : IDisposable
                 }
                 catch (Exception ex)
                 {
-                    LogError("Write", ex);
-                    RaiseStatus("Schreibfehler.", ex.Message);
+                    AppLogger.LogException("Write(Other)", ex);
+                    RaiseStatus("Schreibfehler.");
                     return;
                 }
             }
-            LogError("Write", new IOException("Mehrfache Schreibversuche fehlgeschlagen."));
-            RaiseStatus("Schreibfehler (wiederholt).", "Mehrfache Schreibversuche fehlgeschlagen.");
+            AppLogger.Log("Write failed repeatedly.");
+            RaiseStatus("Schreibfehler (wiederholt).");
         }
         catch (Exception ex)
         {
-            diskOk = false;
-            LogError("WriteOuter", ex);
-            RaiseStatus("Schreibfehler (äußerer).", ex.Message);
+            AppLogger.LogException("WriteOuter", ex);
+            RaiseStatus("Schreibfehler (äußerer).");
         }
     }
 
-    private void LogError(string where, Exception ex)
+    private void RaiseStatus(string text)
     {
-        _lastError = ex.Message;
-        AppLogger.LogException(where + $" [{Config.PortName}]", ex);
-    }
-
-    private void RaiseStatus(string text, string? lastError = null)
-    {
-        StatusChanged?.Invoke(this, new LoggerStatus(Id, text, lastError));
+        StatusChanged?.Invoke(this, new LoggerStatus(Id, text, null));
     }
 
     // Simulation mode (valid frames @ 1 Hz)
@@ -1501,7 +1449,7 @@ public sealed class ComLogger : IDisposable
 
         _simTask = Task.Run(async () =>
         {
-            var rnd = _rnd.Value!;
+            var rnd = new Random();
             while (_simTaskRunning && !token.IsCancellationRequested)
             {
                 try
@@ -1513,11 +1461,11 @@ public sealed class ComLogger : IDisposable
                         v = Math.Abs(v);
                         return sign + v.ToString("00.0000000", CultureInfo.InvariantCulture);
                     }
-                    string Dist(double v)
+                    string Dist4(double v)
                     {
                         string sign = v >= 0 ? "+" : "-";
                         v = Math.Abs(v);
-                        return sign + v.ToString("000.0004".Replace('4', '0'), CultureInfo.InvariantCulture); // keep 4 decimals
+                        return sign + v.ToString("000.0000", CultureInfo.InvariantCulture);
                     }
 
                     double t1 = 20.80 + (rnd.NextDouble() - 0.5) * 0.2;
@@ -1526,17 +1474,8 @@ public sealed class ComLogger : IDisposable
                     double t4 = 0.05 + (rnd.NextDouble() - 0.5) * 0.02;
                     double t5 = 0.05 + (rnd.NextDouble() - 0.5) * 0.02;
                     double t6 = 0.00 + (rnd.NextDouble() - 0.5) * 0.02;
-
                     double x1 = (rnd.NextDouble() - 0.5) * 200;
                     double x2 = (rnd.NextDouble() - 0.5) * 200;
-
-                    // Dist formatting helper corrected:
-                    string Dist4(double v)
-                    {
-                        string sign = v >= 0 ? "+" : "-";
-                        v = Math.Abs(v);
-                        return sign + v.ToString("000.0000", CultureInfo.InvariantCulture);
-                    }
 
                     string raw = "089"
                                  + Temp2(t1) + Temp2(t2) + Temp2(t3) + Temp2(t4) + Temp2(t5) + Temp7(t6)
@@ -1573,7 +1512,6 @@ public sealed record LoggerConfig
 
 public sealed record LoggerStatus(string Id, string StatusText, string? LastError);
 public sealed record LoggerLines(string Id, string[] Last100);
-public sealed record LoggerMetrics(string Id, int LinesPerSecond);
 public sealed record LoggerLive(string Id, string Port, DateTime Ts, string[] Temps, string Raw);
 
 public sealed class AppSettings
