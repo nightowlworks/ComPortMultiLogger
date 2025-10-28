@@ -65,7 +65,7 @@ public static class Defaults
     public const string BaseFolder = @"C:\BaSyTec\Drivers\OSI\";
     public const string FixedFileName = "do_not_delete.txt";
     public const int FixedBaud = 9600;
-    public const string AppVersion = "v1.0.1";
+    public const string AppVersion = "v1.0.5";
 
     // Disk guard (bytes)
     public const long MinFreeBytes = 200L * 1024L * 1024L; // 200 MB
@@ -85,8 +85,8 @@ public static class AppLogger
     private static readonly object _lock = new();
     private static string _logDir = Path.Combine(AppContext.BaseDirectory, "logs");
     private static string _logPath = Path.Combine(_logDir, "app.log");
-    private const long MaxBytes = 512 * 1024; // 512 KB
-    private const int Backups = 3;
+    private const long MaxBytes = 1024 * 1024; // 1 MB
+    private const int Backups = 5;
 
     public static void Init()
     {
@@ -100,11 +100,13 @@ public static class AppLogger
             lock (_lock)
             {
                 RotateIfNeeded();
-                File.AppendAllText(_logPath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {msg}{Environment.NewLine}", Encoding.UTF8);
+                File.AppendAllText(_logPath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {msg}{Environment.NewLine}", new UTF8Encoding(false));
             }
         }
         catch { }
     }
+
+    public static void Debug(string msg) => Log("[DEBUG] " + msg);
 
     public static void LogException(string where, Exception ex)
     {
@@ -125,6 +127,7 @@ public static class AppLogger
                 }
                 File.Copy(_logPath, _logPath + ".1", true);
                 File.WriteAllText(_logPath, string.Empty, new UTF8Encoding(false));
+                Log("Log rotated");
             }
         }
         catch { }
@@ -182,7 +185,7 @@ public sealed class MainForm : Form
     private readonly ComboBox cmbPorts = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160 };
     private readonly TextBox txtFolder = new() { Width = 460, PlaceholderText = @"Ordner für do_not_delete.txt" };
     private readonly Button btnChooseFolder = new() { Text = "Ordner", Width = 90, Height = 32 };
-    private readonly Button btnAdd = new() { Text = "Logger hinzufügen", Width = 150, Height = 32 };
+    private readonly Button btnAdd = new() { Text = "Port hinzufügen", Width = 150, Height = 32 };
     private readonly Button btnAddSim = new() { Text = "Sim-Port", Width = 100, Height = 32 };
     private readonly Button btnRefreshPorts = new() { Text = "Ports aktualisieren", Width = 140, Height = 32 };
 
@@ -210,7 +213,7 @@ public sealed class MainForm : Form
         SplitterWidth = 6
     };
 
-    // Live table
+    // Live table – one row per COM (latest value only)
     private readonly DataGridView dgvLive = new()
     {
         Dock = DockStyle.Fill,
@@ -221,7 +224,8 @@ public sealed class MainForm : Form
         SelectionMode = DataGridViewSelectionMode.FullRowSelect,
         MultiSelect = false,
         RowHeadersVisible = false,
-        AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
+        AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+        EnableHeadersVisualStyles = false
     };
 
     // Footer
@@ -251,12 +255,11 @@ public sealed class MainForm : Form
     private readonly Color _origSplitP1Back;
     private readonly Color _origSplitP2Back;
 
-    // Per-port row color cache
+    // Per-port row color cache and live row map
     private readonly Dictionary<string, Color> _portColorMap = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DataGridViewRow> _liveRowsByPort = new(StringComparer.OrdinalIgnoreCase);
 
-    // Caps
-    private const int MaxLiveRows = 200;
-
+    // Active loggers
     private readonly Dictionary<string, ComLogger> loggers = new();
 
     public MainForm()
@@ -304,7 +307,7 @@ public sealed class MainForm : Form
         lblTitle.Font = new Font("Segoe UI", 24, FontStyle.Bold);
         lblTitle.ForeColor = Color.White;
 
-        lblSubtitle.Text = " Frames: 089…980. • 6× Temp. [±dd.dd], 2× Distance [±dd.dddd]";
+        lblSubtitle.Text = "Frames: 089…980 (ohne Punkt).  •  T1–T5: [±dd.dd], T6: [±dd.ddddddd]  •  Dist: [±ddd.dddd]  •  Output: T1–T6";
         lblSubtitle.Font = new Font("Segoe UI", 10, FontStyle.Regular);
         lblSubtitle.ForeColor = Color.Gainsboro;
 
@@ -326,14 +329,12 @@ public sealed class MainForm : Form
         headerPanel.Controls.Add(headerLeft);
         headerPanel.Controls.Add(headerRight);
 
-        // ===== Loggers ListView — removed "Datei" column
-        lv.Columns.Add("ID", 70);                // 0
-        lv.Columns.Add("Port", 90);              // 1
-        lv.Columns.Add("Ordner", 640);           // 2
-        lv.Columns.Add("Status", 200);           // 3
-        lv.Columns.Add("Rate (Zeilen/s)", 120);  // 4
-        lv.Columns.Add("Letzter Fehler", 300);   // 5
-        lv.Columns.Add("Age", 80);               // 6
+        // ===== Loggers ListView — minimal columns (no ID, no Rate)
+        lv.Columns.Add("Port", 120);             // 0
+        lv.Columns.Add("Ordner", 700);           // 1
+        lv.Columns.Add("Status", 260);           // 2
+        lv.Columns.Add("Letzter Fehler", 360);   // 3
+        lv.Columns.Add("Age", 80);               // 4
 
         TryEnableDoubleBuffer(lv);
         TryEnableDoubleBuffer(dgvLive);
@@ -352,7 +353,7 @@ public sealed class MainForm : Form
         };
         pnlButtons.Controls.AddRange(new Control[] { btnStart, btnStop, btnRemove, btnOpenFolder, btnClearLive });
 
-        // ===== Live Grid columns
+        // ===== Live Grid columns (one row per COM, updated)
         dgvLive.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Zeit", Name = "Time", FillWeight = 120 });
         dgvLive.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "COM", Name = "COM", FillWeight = 80 });
         dgvLive.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "T1", Name = "T1" });
@@ -362,6 +363,20 @@ public sealed class MainForm : Form
         dgvLive.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "T5", Name = "T5" });
         dgvLive.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "T6", Name = "T6" });
         dgvLive.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "RAW", Name = "RAW", FillWeight = 240 });
+
+        // Do not highlight clicked/updated rows in LIVE grid
+        dgvLive.DefaultCellStyle.SelectionBackColor = dgvLive.DefaultCellStyle.BackColor;
+        dgvLive.DefaultCellStyle.SelectionForeColor = dgvLive.DefaultCellStyle.ForeColor;
+        dgvLive.SelectionChanged += (_, __) => { try { dgvLive.ClearSelection(); } catch { } };
+        dgvLive.RowsAdded += (_, e) =>
+        {
+            for (int i = 0; i < e.RowCount; i++)
+            {
+                var row = dgvLive.Rows[e.RowIndex + i];
+                row.DefaultCellStyle.SelectionBackColor = row.DefaultCellStyle.BackColor;
+                row.DefaultCellStyle.SelectionForeColor = row.DefaultCellStyle.ForeColor;
+            }
+        };
 
         // ===== Footer (status)
         slVersion.Text = $"Version {Defaults.AppVersion}";
@@ -389,14 +404,15 @@ public sealed class MainForm : Form
         btnStop.Click += (_, __) => StopSelected();
         btnRemove.Click += (_, __) => RemoveSelected();
         btnOpenFolder.Click += (_, __) => OpenFolderSelected();
-        btnClearLive.Click += (_, __) => { try { dgvLive.Rows.Clear(); } catch { } btnClearLive.Enabled = false; };
+        btnClearLive.Click += (_, __) => { try { dgvLive.Rows.Clear(); _liveRowsByPort.Clear(); } catch { } btnClearLive.Enabled = false; };
 
         FormClosing += (_, __) =>
         {
             try
             {
                 foreach (var lg in loggers.Values) lg.Dispose();
-                AppSettings.Save(CaptureSettings());
+                // On next start the selected COMs shall be empty:
+                AppSettings.Save(new AppSettings { DefaultFolder = NormalizeFolder(txtFolder.Text) });
             }
             catch { }
         };
@@ -404,10 +420,7 @@ public sealed class MainForm : Form
         // Init
         var settings = AppSettings.Load();
         RefreshPorts();
-        if (string.IsNullOrWhiteSpace(settings.DefaultFolder))
-            settings.DefaultFolder = Defaults.BaseFolder;
-        txtFolder.Text = NormalizeFolder(settings.DefaultFolder);
-        RestoreSettings(settings);
+        txtFolder.Text = NormalizeFolder(settings.DefaultFolder ?? Defaults.BaseFolder);
         UpdateButtons();
 
         // Originalfarben merken (für Warnmodus)
@@ -428,7 +441,7 @@ public sealed class MainForm : Form
         };
         _errorUiTimer.Start();
 
-        // Watchdog: update Age column and stalled state
+        // Watchdog: update Age column and auto-reconnect on inactivity/unplug
         _watchdogTimer.Tick += (_, __) => WatchdogScan();
         _watchdogTimer.Start();
     }
@@ -471,7 +484,10 @@ public sealed class MainForm : Form
                 picLogo.Image = Image.FromStream(ms);
             }
         }
-        catch { /* optional */ }
+        catch (Exception ex)
+        {
+            AppLogger.LogException("LoadLogo", ex);
+        }
     }
 
     private static string NormalizeFolder(string path)
@@ -505,6 +521,7 @@ public sealed class MainForm : Form
             if (cmbPorts.Items.Count > 0 && cmbPorts.SelectedIndex < 0)
                 cmbPorts.SelectedIndex = 0;
             slState.Text = "Ports aktualisiert";
+            AppLogger.Debug("Ports: " + string.Join(",", ports));
         }
         catch (Exception ex)
         {
@@ -517,11 +534,6 @@ public sealed class MainForm : Form
     {
         var port = cmbPorts.SelectedItem as string;
         if (string.IsNullOrWhiteSpace(port)) { slState.Text = "Bitte Port wählen"; return; }
-        if (!SerialPort.GetPortNames().Contains(port, StringComparer.OrdinalIgnoreCase))
-        {
-            slState.Text = $"Port {port} nicht mehr vorhanden";
-            return;
-        }
 
         var folder = NormalizeFolder(txtFolder.Text.Trim());
         try { Directory.CreateDirectory(folder); }
@@ -542,24 +554,28 @@ public sealed class MainForm : Form
 
     private void AddLogger(string port, string folder, bool simulated)
     {
+        if (loggers.Values.Any(l => string.Equals(l.Config.PortName, port, StringComparison.OrdinalIgnoreCase)))
+        {
+            slState.Text = $"Port {port} ist bereits hinzugefügt.";
+            return;
+        }
+
         var cfg = new LoggerConfig { PortName = port, FolderPath = folder, Simulated = simulated };
 
-        var id = Guid.NewGuid().ToString("N")[..8];
-        var logger = new ComLogger(id, cfg);
+        var logger = new ComLogger(port, cfg); // use port as Id now
         logger.StatusChanged += OnLoggerStatus;
         logger.MetricsUpdated += OnLoggerMetrics;
         logger.LiveRow += OnLoggerLiveRow;
 
-        loggers[id] = logger;
+        loggers[port] = logger;
 
         var item = new ListViewItem(new[]
         {
-            id, cfg.PortName, cfg.FolderPath,
-            simulated ? "Simuliert (gestoppt)" : "Gestoppt", "0", "-", "-"
+            cfg.PortName, cfg.FolderPath,
+            simulated ? "Simuliert (gestoppt)" : "Gestoppt", "-", "-"
         })
-        { Name = id, Tag = logger, UseItemStyleForSubItems = false };
+        { Name = port, Tag = logger, UseItemStyleForSubItems = false };
 
-        // Apply soft color to row
         var color = GetSoftColorForPort(cfg.PortName);
         item.BackColor = color;
 
@@ -567,8 +583,27 @@ public sealed class MainForm : Form
         lv.SelectedItems.Clear();
         item.Selected = true;
 
-        slState.Text = simulated ? $"Sim-Logger {id} hinzugefügt" : $"Logger {id} hinzugefügt";
+        // Create or get live row for this port
+        EnsureLiveRowForPort(cfg.PortName);
+
+        slState.Text = simulated ? $"Sim-Port {port} hinzugefügt" : $"Port {port} hinzugefügt";
+        AppLogger.Log($"Logger added: port={cfg.PortName}, folder={cfg.FolderPath}, sim={simulated}");
         UpdateButtons();
+    }
+
+    private DataGridViewRow EnsureLiveRowForPort(string port)
+    {
+        if (_liveRowsByPort.TryGetValue(port, out var row)) return row;
+
+        int idx = dgvLive.Rows.Add(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"), port, "", "", "", "", "", "", "");
+        row = dgvLive.Rows[idx];
+        var color = GetSoftColorForPort(port);
+        row.DefaultCellStyle.BackColor = color;
+        row.DefaultCellStyle.SelectionBackColor = color;
+        row.DefaultCellStyle.SelectionForeColor = dgvLive.DefaultCellStyle.ForeColor;
+        _liveRowsByPort[port] = row;
+        btnClearLive.Enabled = dgvLive.Rows.Count > 0;
+        return row;
     }
 
     private Color GetSoftColorForPort(string port)
@@ -635,20 +670,20 @@ public sealed class MainForm : Form
             {
                 if (it.Tag is not ComLogger lg) continue;
 
-                // update Age column (index 6)
+                // update Age column (index 4)
                 double ageSec = lg.LastFrameUtc == DateTime.MinValue ? double.NaN
                     : (DateTime.UtcNow - lg.LastFrameUtc).TotalSeconds;
 
-                it.SubItems[6].Text = double.IsNaN(ageSec) ? "-" : $"{ageSec:0.0}s";
+                it.SubItems[4].Text = double.IsNaN(ageSec) ? "-" : $"{ageSec:0.0}s";
 
-                // Stalled threshold 10s when running
-                if (lg.IsRunning && !double.IsNaN(ageSec) && ageSec >= 10.0)
+                // Inactivity/unplug threshold → force reconnect loop
+                if (lg.IsRunning && (double.IsNaN(ageSec) || ageSec >= 3.0))
                 {
-                    var sub = it.SubItems[3]; // Status column
+                    var sub = it.SubItems[2]; // Status column
                     sub.ForeColor = Color.DarkOrange;
                     sub.Font = new Font(lv.Font, FontStyle.Bold);
-                    sub.Text = "Stalled – keine Frames";
-                    lg.TryWatchdogReopen();
+                    sub.Text = "Reconnect …";
+                    lg.RequestReconnect("watchdog_idle");
                 }
             }
         }
@@ -663,23 +698,21 @@ public sealed class MainForm : Form
         if (IsDisposed || Disposing) return;
         BeginInvoke(new Action(() =>
         {
-            if (!lv.Items.ContainsKey(e.Id)) return;
+            if (!lv.Items.ContainsKey(e.Id)) return; // Id == Port
             var it = lv.Items[e.Id];
-            it.SubItems[3].Text = e.StatusText; // Status
-            it.SubItems[5].Text = string.IsNullOrEmpty(e.LastError) ? "-" : e.LastError; // LastError
+            it.SubItems[2].Text = e.StatusText; // Status
+            it.SubItems[3].Text = string.IsNullOrEmpty(e.LastError) ? "-" : e.LastError; // LastError
 
-            // Fehler-Set pflegen, Zielzustand für Error-UI setzen (debounced)
             if (!string.IsNullOrWhiteSpace(e.LastError))
                 _loggersWithError.Add(e.Id);
             else
                 _loggersWithError.Remove(e.Id);
             _wantErrorUi = _loggersWithError.Count > 0;
 
-            // Status SubItem grün & fett wenn logger läuft
             if (it.Tag is ComLogger logger)
             {
-                var statusSub = it.SubItems[3];
-                if (logger.IsRunning && !statusSub.Text.StartsWith("Stalled", StringComparison.OrdinalIgnoreCase))
+                var statusSub = it.SubItems[2];
+                if (logger.IsRunning && !statusSub.Text.StartsWith("Reconnect", StringComparison.OrdinalIgnoreCase))
                 {
                     statusSub.ForeColor = Color.Green;
                     statusSub.Font = new Font(lv.Font, FontStyle.Bold);
@@ -698,12 +731,7 @@ public sealed class MainForm : Form
 
     private void OnLoggerMetrics(object? sender, LoggerMetrics e)
     {
-        if (IsDisposed || Disposing) return;
-        BeginInvoke(new Action(() =>
-        {
-            if (!lv.Items.ContainsKey(e.Id)) return;
-            lv.Items[e.Id].SubItems[4].Text = e.LinesPerSecond.ToString(); // Rate column
-        }));
+        // rate column removed – no-op
     }
 
     private void OnLoggerLiveRow(object? sender, LoggerLive e)
@@ -713,32 +741,19 @@ public sealed class MainForm : Form
         {
             try
             {
-                int rowIndex = dgvLive.Rows.Add(
-                    e.Ts.ToString("yyyy-MM-dd HH:mm:ss.fff"),
-                    e.Port,
-                    e.Temps.Length > 0 ? e.Temps[0] : "",
-                    e.Temps.Length > 1 ? e.Temps[1] : "",
-                    e.Temps.Length > 2 ? e.Temps[2] : "",
-                    e.Temps.Length > 3 ? e.Temps[3] : "",
-                    e.Temps.Length > 4 ? e.Temps[4] : "",
-                    e.Temps.Length > 5 ? e.Temps[5] : "",
-                    e.Raw
-                );
+                var row = EnsureLiveRowForPort(e.Port);
+                row.Cells["Time"].Value = e.Ts.ToString("yyyy-MM-dd HH:mm:ss.fff");
+                row.Cells["COM"].Value = e.Port;
+                row.Cells["T1"].Value = e.Temps.Length > 0 ? e.Temps[0] : "";
+                row.Cells["T2"].Value = e.Temps.Length > 1 ? e.Temps[1] : "";
+                row.Cells["T3"].Value = e.Temps.Length > 2 ? e.Temps[2] : "";
+                row.Cells["T4"].Value = e.Temps.Length > 3 ? e.Temps[3] : "";
+                row.Cells["T5"].Value = e.Temps.Length > 4 ? e.Temps[4] : "";
+                row.Cells["T6"].Value = e.Temps.Length > 5 ? e.Temps[5] : "";
+                row.Cells["RAW"].Value = e.Raw;
 
-                // Color the entire row based on port
-                var color = GetSoftColorForPort(e.Port);
-                dgvLive.Rows[rowIndex].DefaultCellStyle.BackColor = color;
-
-                while (dgvLive.Rows.Count > MaxLiveRows)
-                    dgvLive.Rows.RemoveAt(0);
-
-                if (dgvLive.Rows.Count > 0)
-                {
-                    int lastIdx = dgvLive.Rows.Count - 1;
-                    dgvLive.FirstDisplayedScrollingRowIndex = Math.Max(0, lastIdx);
-                    dgvLive.ClearSelection();
-                    dgvLive.Rows[lastIdx].Selected = true;
-                }
+                // Do NOT select or highlight anything
+                dgvLive.ClearSelection();
 
                 btnClearLive.Enabled = dgvLive.Rows.Count > 0;
             }
@@ -790,9 +805,11 @@ public sealed class MainForm : Form
 
         if (!logger.Config.Simulated)
         {
+            // allow start even if port missing; reconnect loop will wait
             if (!SerialPort.GetPortNames().Contains(logger.Config.PortName, StringComparer.OrdinalIgnoreCase))
             {
-                slState.Text = $"Port {logger.Config.PortName} nicht vorhanden";
+                slState.Text = $"Port {logger.Config.PortName} nicht vorhanden – warte auf Gerät …";
+                logger.RequestReconnect("start_missing");
                 return;
             }
             if (loggers.Values.Any(l => !ReferenceEquals(l, logger) && l.IsRunning &&
@@ -818,7 +835,7 @@ public sealed class MainForm : Form
         if (lv.SelectedItems.Count != 1) return;
         var sel = lv.SelectedItems[0];
         if (sel is null) return;
-        var id = sel.Name;
+        var id = sel.Name; // port
         if (!string.IsNullOrEmpty(id) && loggers.TryGetValue(id, out var logger))
         {
             logger.Dispose();
@@ -826,7 +843,15 @@ public sealed class MainForm : Form
             lv.Items.RemoveByKey(id);
             _loggersWithError.Remove(id);
             _wantErrorUi = _loggersWithError.Count > 0;
-            slState.Text = $"Logger {id} entfernt";
+
+            // remove live row
+            if (_liveRowsByPort.TryGetValue(id, out var row))
+            {
+                dgvLive.Rows.Remove(row);
+                _liveRowsByPort.Remove(id);
+            }
+
+            slState.Text = $"Port {id} entfernt";
             UpdateButtons();
         }
     }
@@ -846,43 +871,6 @@ public sealed class MainForm : Form
             slState.Text = $"Ordner öffnen fehlgeschlagen: {ex.Message}";
             AppLogger.LogException("OpenFolderSelected", ex);
         }
-    }
-
-    private void RestoreSettings(AppSettings s)
-    {
-        foreach (var cfg in s.Loggers)
-        {
-            cfg.FolderPath = NormalizeFolder(cfg.FolderPath);
-            var id = Guid.NewGuid().ToString("N")[..8];
-            var logger = new ComLogger(id, cfg);
-            logger.StatusChanged += OnLoggerStatus;
-            logger.MetricsUpdated += OnLoggerMetrics;
-            logger.LiveRow += OnLoggerLiveRow;
-            loggers[id] = logger;
-
-            var item = new ListViewItem(new[]
-            {
-                id, cfg.PortName, cfg.FolderPath,
-                cfg.Simulated ? "Simuliert (gestoppt)" : "Gestoppt", "0", "-", "-"
-            })
-            { Name = id, Tag = logger, UseItemStyleForSubItems = false };
-
-            var color = GetSoftColorForPort(cfg.PortName);
-            item.BackColor = color;
-
-            lv.Items.Add(item);
-        }
-
-        txtFolder.Text = NormalizeFolder(s.DefaultFolder ?? Defaults.BaseFolder);
-    }
-
-    private AppSettings CaptureSettings()
-    {
-        return new AppSettings
-        {
-            DefaultFolder = NormalizeFolder(txtFolder.Text),
-            Loggers = loggers.Values.Select(l => l.Config).ToList()
-        };
     }
 }
 
@@ -905,14 +893,16 @@ public sealed class ComLogger : IDisposable
     private string? _lastError;
     private CancellationTokenSource? _cts;
     private int _reconnectAttempt;
+    private bool _reconnectLoopRunning;
     private readonly WinFormsTimer _rateTimer = new() { Interval = 1000 };
+    private readonly WinFormsTimer _idleTimer = new() { Interval = 3000 }; // auto-reopen if idle
     private int _linesThisSecond = 0;
 
     // For simulation mode
     private Task? _simTask;
     private bool _simTaskRunning;
 
-    // Strict frame: 089 + 6 temps (+/-dd.dd) + 2 distances (+/-dd.dddd) + 980.
+    // Strict frame (terminator "980" without dot)
     private static readonly Regex FrameRegex = new(
         @"^089" +
         @"(?<t1>[+-]\d{2}\.\d{2})" +
@@ -920,13 +910,13 @@ public sealed class ComLogger : IDisposable
         @"(?<t3>[+-]\d{2}\.\d{2})" +
         @"(?<t4>[+-]\d{2}\.\d{2})" +
         @"(?<t5>[+-]\d{2}\.\d{2})" +
-        @"(?<t6>[+-]\d{2}\.\d{2})" +
-        @"(?<x1>[+-]\d{2}\.\d{4})" +
-        @"(?<x2>[+-]\d{2}\.\d{4})" +
-        @"980\.$",
+        @"(?<t6>[+-]\d{2}\.\d{7})" +
+        @"(?<x1>[+-]\d{3}\.\d{4})" +
+        @"(?<x2>[+-]\d{3}\.\d{4})" +
+        @"980$",
         RegexOptions.Compiled);
 
-    private const int MaxBuffer = 16 * 1024;
+    private const int MaxBuffer = 64 * 1024;
 
     // Watchdog info: store ticks atomically
     private long _lastFrameTicks; // 0 == unset
@@ -944,6 +934,9 @@ public sealed class ComLogger : IDisposable
         }
     }
 
+    // encoder for pure UTF-8 without BOM
+    private static readonly UTF8Encoding Utf8NoBom = new UTF8Encoding(false);
+
     // Jitter
     private static readonly ThreadLocal<Random> _rnd = new(() => new Random(unchecked(Environment.TickCount * 31 + Thread.CurrentThread.ManagedThreadId)));
 
@@ -951,7 +944,7 @@ public sealed class ComLogger : IDisposable
 
     public ComLogger(string id, LoggerConfig config)
     {
-        Id = id;
+        Id = id;                 // Id == Port name
         Config = config;
 
         _rateTimer.Tick += (_, __) =>
@@ -960,6 +953,20 @@ public sealed class ComLogger : IDisposable
             MetricsUpdated?.Invoke(this, new LoggerMetrics(Id, rate));
         };
         _rateTimer.Start();
+
+        // Idle timer: if no frames for a while, try reconnect
+        _idleTimer.Tick += (_, __) =>
+        {
+            if (!IsRunning || Config.Simulated) return;
+            var last = LastFrameUtc;
+            var age = last == DateTime.MinValue ? TimeSpan.MaxValue : DateTime.UtcNow - last;
+            if (age.TotalSeconds >= 3)
+            {
+                AppLogger.Debug($"IdleTimer: no data for {age.TotalSeconds:0.0}s on {Config.PortName}, requesting reconnect");
+                RequestReconnect("idle_timer");
+            }
+        };
+        _idleTimer.Start();
     }
 
     public async Task StartAsync()
@@ -977,22 +984,13 @@ public sealed class ComLogger : IDisposable
 
             if (!SerialPort.GetPortNames().Contains(Config.PortName, StringComparer.OrdinalIgnoreCase))
             {
-                // Auto-rebind (light): if exactly one other port exists, try it
-                var ports = SerialPort.GetPortNames();
-                if (ports.Length == 1)
-                {
-                    Config.PortName = ports[0];
-                    AppLogger.Log($"Auto-rebind: using single available port {Config.PortName}");
-                }
-                else
-                {
-                    RaiseStatus($"Port {Config.PortName} nicht vorhanden", "Port fehlt");
-                    return;
-                }
+                RaiseStatus($"Port {Config.PortName} nicht vorhanden", "Port fehlt");
+                RequestReconnect("start_missing");
+                return;
             }
 
             OpenSerial();
-            _cts = new CancellationTokenSource();
+            _cts ??= new CancellationTokenSource();
             _reconnectAttempt = 0;
             RaiseStatus($"Läuft – {Config.PortName} @ {Defaults.FixedBaud}.");
         }
@@ -1000,19 +998,19 @@ public sealed class ComLogger : IDisposable
         {
             LogError("Start (Port belegt/kein Zugriff)", ex);
             RaiseStatus("Start fehlgeschlagen (Zugriff verweigert). Reconnect …", ex.Message);
-            await ReconnectLoopAsync();
+            RequestReconnect("start_unauthorized");
         }
         catch (IOException ex)
         {
             LogError("Start (I/O)", ex);
             RaiseStatus("Start fehlgeschlagen (I/O). Reconnect …", ex.Message);
-            await ReconnectLoopAsync();
+            RequestReconnect("start_io");
         }
         catch (Exception ex)
         {
             LogError("Start", ex);
             RaiseStatus("Start fehlgeschlagen. Reconnect …", ex.Message);
-            await ReconnectLoopAsync();
+            RequestReconnect("start_other");
         }
     }
 
@@ -1041,6 +1039,8 @@ public sealed class ComLogger : IDisposable
         }
         catch { }
 
+        _reconnectLoopRunning = false;
+
         RaiseStatus(Config.Simulated ? "Simuliert (gestoppt)." : "Gestoppt.");
     }
 
@@ -1066,82 +1066,67 @@ public sealed class ComLogger : IDisposable
             sp.DataReceived += SerialOnDataReceived;
             sp.Open();
             _serial = sp;
+            AppLogger.Log($"Serial opened: {Config.PortName} @ {Defaults.FixedBaud}");
         }
     }
 
-    private async Task ReconnectLoopAsync()
+    public void RequestReconnect(string reason)
     {
-        while (_cts is { IsCancellationRequested: false })
-        {
-            _reconnectAttempt++;
-            int baseDelay = (int)Math.Min(30000, Math.Pow(2, Math.Min(6, _reconnectAttempt)) * 250);
-            int jitter = _rnd.Value!.Next(-200, 200);
-            int delay = Math.Max(100, baseDelay + jitter);
-            RaiseStatus($"Reconnect-Versuch {_reconnectAttempt} in {delay} ms …");
-            try { await Task.Delay(delay, _cts!.Token); } catch { return; }
+        if (_reconnectLoopRunning) return;
+        _reconnectLoopRunning = true;
+        _cts ??= new CancellationTokenSource();
 
+        Task.Run(async () =>
+        {
             try
             {
-                if (Config.Simulated)
+                AppLogger.Debug($"Reconnect loop begin: port={Config.PortName}, reason={reason}");
+                while (!_cts.IsCancellationRequested)
                 {
-                    StartSimulated();
-                    _reconnectAttempt = 0;
-                    RaiseStatus($"Wieder verbunden – {Config.PortName} (Sim).");
-                    return;
-                }
-
-                var ports = SerialPort.GetPortNames();
-                if (!ports.Contains(Config.PortName, StringComparer.OrdinalIgnoreCase))
-                {
-                    if (ports.Length == 1)
+                    try
                     {
-                        Config.PortName = ports[0];
-                        AppLogger.Log($"Auto-rebind during reconnect: {Config.PortName}");
+                        // ensure fully closed
+                        lock (_serialLock)
+                        {
+                            if (_serial != null)
+                            {
+                                _serial.DataReceived -= SerialOnDataReceived;
+                                if (_serial.IsOpen) _serial.Close();
+                                _serial.Dispose();
+                                _serial = null;
+                            }
+                        }
+
+                        var ports = SerialPort.GetPortNames();
+                        if (!ports.Contains(Config.PortName, StringComparer.OrdinalIgnoreCase))
+                        {
+                            RaiseStatus($"Warte auf Gerät – {Config.PortName}", "Port fehlt");
+                        }
+                        else
+                        {
+                            OpenSerial();
+                            _reconnectAttempt = 0;
+                            RaiseStatus($"Wieder verbunden – {Config.PortName} @ {Defaults.FixedBaud}.");
+                            _reconnectLoopRunning = false;
+                            return;
+                        }
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        continue;
+                        LogError("ReconnectLoopOpen", ex);
+                        RaiseStatus("Reconnect fehlgeschlagen.", ex.Message);
                     }
-                }
 
-                OpenSerial();
-                _reconnectAttempt = 0;
-                RaiseStatus($"Wieder verbunden – {Config.PortName} @ {Defaults.FixedBaud}.");
-                return;
-            }
-            catch (Exception ex)
-            {
-                LogError("Reconnect", ex);
-                RaiseStatus("Reconnect fehlgeschlagen.", ex.Message);
-            }
-        }
-    }
-
-    // Watchdog tries to reopen on stall
-    public void TryWatchdogReopen()
-    {
-        if (Config.Simulated) return;
-        try
-        {
-            lock (_serialLock)
-            {
-                if (_serial != null)
-                {
-                    _serial.DataReceived -= SerialOnDataReceived;
-                    if (_serial.IsOpen) _serial.Close();
-                    _serial.Dispose();
-                    _serial = null;
+                    _reconnectAttempt++;
+                    int baseDelay = (int)Math.Min(30000, Math.Pow(2, Math.Min(6, _reconnectAttempt)) * 250);
+                    int jitter = _rnd.Value!.Next(-200, 200);
+                    int delay = Math.Max(500, baseDelay + jitter);
+                    await Task.Delay(delay, _cts.Token);
                 }
             }
-            OpenSerial();
-            _reconnectAttempt = 0;
-            RaiseStatus($"Watchdog Reopen – {Config.PortName} @ {Defaults.FixedBaud}.");
-        }
-        catch (Exception ex)
-        {
-            LogError("WatchdogReopen", ex);
-            RaiseStatus("Watchdog Reopen fehlgeschlagen.", ex.Message);
-        }
+            catch { }
+            finally { _reconnectLoopRunning = false; }
+        });
     }
 
     private void SerialOnDataReceived(object? sender, SerialDataReceivedEventArgs e)
@@ -1155,6 +1140,8 @@ public sealed class ComLogger : IDisposable
             var chunk = s.ReadExisting();
             if (string.IsNullOrEmpty(chunk)) return;
 
+            AppLogger.Debug($"DataReceived: chunk len={chunk.Length}, preview='{SafePreview(chunk)}'");
+
             lock (_buf)
             {
                 _buf.Append(chunk);
@@ -1164,7 +1151,16 @@ public sealed class ComLogger : IDisposable
                     var all = _buf.ToString();
                     int startIdx = all.LastIndexOf("089", StringComparison.Ordinal);
                     _buf.Clear();
-                    if (startIdx >= 0) _buf.Append(all.AsSpan(startIdx));
+                    if (startIdx >= 0)
+                    {
+                        var tail = all.AsSpan(startIdx);
+                        _buf.Append(tail);
+                        AppLogger.Debug($"Buffer trimmed, kept tail from last '089', tailLen={tail.Length}");
+                    }
+                    else
+                    {
+                        AppLogger.Debug("Buffer trimmed, no '089' found, buffer cleared");
+                    }
                 }
 
                 ExtractFramesFromBuffer();
@@ -1173,29 +1169,20 @@ public sealed class ComLogger : IDisposable
         catch (Exception ex)
         {
             LogError("DataReceived", ex);
-            Task.Run(async () =>
-            {
-                try
-                {
-                    lock (_serialLock)
-                    {
-                        if (_serial != null)
-                        {
-                            _serial.DataReceived -= SerialOnDataReceived;
-                            if (_serial.IsOpen) _serial.Close();
-                            _serial.Dispose();
-                            _serial = null;
-                        }
-                    }
-                }
-                catch { }
-                await ReconnectLoopAsync();
-            });
+            RequestReconnect("data_received_exception");
         }
     }
 
+    private static string SafePreview(string s)
+    {
+        s = s.Replace("\r", "\\r").Replace("\n", "\\n");
+        return s.Length <= 120 ? s : s.Substring(0, 120) + "...";
+    }
+
+    // Frame extraction with terminator "980" and optional CR/LF
     private void ExtractFramesFromBuffer()
     {
+        const string Terminator = "980";
         while (true)
         {
             string all = _buf.ToString();
@@ -1205,50 +1192,70 @@ public sealed class ComLogger : IDisposable
                 _buf.Clear();
                 return;
             }
-            int end = all.IndexOf("980.", start, StringComparison.Ordinal);
-            if (end < 0 || end + "980.".Length > all.Length)
+
+            int end = all.IndexOf(Terminator, start, StringComparison.Ordinal);
+            if (end < 0)
             {
                 if (start > 0) _buf.Remove(0, start);
+                AppLogger.Debug($"Partial frame waiting, bufferLen={_buf.Length}");
                 return;
             }
-            int frameLen = end - start + "980.".Length;
+
+            int frameLen = end - start + Terminator.Length;
             string candidate = all.Substring(start, frameLen);
-            _buf.Remove(0, start + frameLen);
+
+            // remove consumed including trailing CR/LF
+            int removeLen = start + frameLen;
+            if (all.Length > removeLen && (all[removeLen] == '\r' || all[removeLen] == '\n'))
+            {
+                removeLen++;
+                if (all.Length > removeLen && all[removeLen - 1] == '\r' && all[removeLen] == '\n') removeLen++;
+            }
+            _buf.Remove(0, removeLen);
 
             var m = FrameRegex.Match(candidate);
-            if (!m.Success) continue;
+            if (!m.Success)
+            {
+                AppLogger.Log($"Invalid frame format (len={candidate.Length}): '{SafePreview(candidate)}'");
+                continue;
+            }
 
             // Parse temps
             var tempsDouble = new[] { "t1", "t2", "t3", "t4", "t5", "t6" }
                 .Select(k => ParseDoubleInvariant(m.Groups[k].Value))
                 .ToArray();
 
+            // Output format: +20.8800,+20.8400,... (4 decimals, with sign)
             string[] tempsFormatted = tempsDouble
                 .Select(v => v.HasValue
                     ? v.Value.ToString("+0.0000;-0.0000", CultureInfo.InvariantCulture)
                     : "+0.0000")
                 .ToArray();
 
-            // Compose file content line
             string fileLine = string.Join(",", tempsFormatted);
 
-            // Live info & raise
             DateTime ts = DateTime.Now;
+
+            // Live + debug
             AppendToLive($"{ts:yyyy-MM-dd HH:mm:ss.fff} | RAW={candidate} | T= {fileLine}");
+            AppLogger.Debug($"Frame OK: port={Config.PortName}, temps={fileLine}, rawLen={candidate.Length}");
+
             LiveRow?.Invoke(this, new LoggerLive(Id, Config.PortName, ts, tempsFormatted, candidate));
 
             // Only keep last value in do_not_delete.txt (atomic)
-            WriteLastValueSafe(fileLine, out bool diskOk);
+            WriteLastValueSafe(fileLine, out bool _);
 
-            // update metrics + watchdog
-            if (diskOk) LastFrameUtc = DateTime.UtcNow;
+            // update watchdog timestamp even if file write failed
+            LastFrameUtc = DateTime.UtcNow;
+
             Interlocked.Increment(ref _linesThisSecond);
         }
     }
 
     private static double? ParseDoubleInvariant(string s)
     {
-        return double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : (double?)null;
+        return double.TryParse(s, NumberStyles.Float | NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var v)
+            ? v : (double?)null;
     }
 
     private void AppendToLive(string line)
@@ -1258,25 +1265,29 @@ public sealed class ComLogger : IDisposable
         LinesUpdated?.Invoke(this, new LoggerLines(Id, _last100.ToArray()));
     }
 
-    // Disk guard + atomic replace with retries
+    // Disk guard + atomic replace with retries (UTF-8 without BOM)
     private void WriteLastValueSafe(string fileLine, out bool diskOk)
     {
         diskOk = true;
         try
         {
             string target = Config.OutputPath;
-            string root = Path.GetPathRoot(target)!;
-            try
+            string? root = Path.GetPathRoot(target);
+            if (!string.IsNullOrEmpty(root))
             {
-                var di = new DriveInfo(root);
-                if (di.AvailableFreeSpace < Defaults.MinFreeBytes)
+                try
                 {
-                    RaiseStatus("Wenig Speicher – Logging pausiert", "Freier Speicher < 200 MB");
-                    diskOk = false;
-                    return;
+                    var di = new DriveInfo(root);
+                    if (di.AvailableFreeSpace < Defaults.MinFreeBytes)
+                    {
+                        RaiseStatus("Wenig Speicher – Logging pausiert", "Freier Speicher < 200 MB");
+                        AppLogger.Log("Low disk space: logging paused");
+                        diskOk = false;
+                        return;
+                    }
                 }
+                catch (Exception ex) { AppLogger.LogException("DriveInfo", ex); }
             }
-            catch { /* ignore disk info errors */ }
 
             for (int attempt = 0; attempt < 3; attempt++)
             {
@@ -1286,7 +1297,7 @@ public sealed class ComLogger : IDisposable
                     {
                         Directory.CreateDirectory(Config.FolderPath);
                         string tmp = target + ".tmp";
-                        File.WriteAllText(tmp, fileLine + Environment.NewLine, Encoding.UTF8);
+                        File.WriteAllText(tmp, fileLine + Environment.NewLine, Utf8NoBom);
                         try
                         {
                             File.Replace(tmp, target, null);
@@ -1296,10 +1307,12 @@ public sealed class ComLogger : IDisposable
                             File.Move(tmp, target);
                         }
                     }
+                    AppLogger.Debug($"Last value written: '{fileLine}' -> {target}");
                     return;
                 }
-                catch (IOException)
+                catch (IOException ex)
                 {
+                    AppLogger.LogException("Write(IO)", ex);
                     Thread.Sleep(100);
                 }
                 catch (Exception ex)
@@ -1323,7 +1336,7 @@ public sealed class ComLogger : IDisposable
     private void LogError(string where, Exception ex)
     {
         _lastError = ex.Message;
-        AppLogger.LogException(where, ex);
+        AppLogger.LogException(where + $" [{Config.PortName}]", ex);
     }
 
     private void RaiseStatus(string text, string? lastError = null)
@@ -1331,11 +1344,11 @@ public sealed class ComLogger : IDisposable
         StatusChanged?.Invoke(this, new LoggerStatus(Id, text, lastError));
     }
 
-    // Simulation mode: generate valid frames 1 Hz
+    // Simulation mode
     private void StartSimulated()
     {
         _simTaskRunning = true;
-        _cts = new CancellationTokenSource();
+        _cts ??= new CancellationTokenSource();
         var token = _cts.Token;
 
         _simTask = Task.Run(async () =>
@@ -1345,30 +1358,46 @@ public sealed class ComLogger : IDisposable
             {
                 try
                 {
-                    // temperatures ±dd.dd
-                    string Temp(double v) => v.ToString("+00.00;-00.00", CultureInfo.InvariantCulture);
-                    string Dist(double v) => v.ToString("+00.0000;-00.0000", CultureInfo.InvariantCulture);
+                    string Temp2(double v) => v.ToString("+00.00;-00.00", CultureInfo.InvariantCulture);
+                    string Temp7(double v)
+                    {
+                        string sign = v >= 0 ? "+" : "-";
+                        v = Math.Abs(v);
+                        return sign + v.ToString("00.0000000", CultureInfo.InvariantCulture);
+                    }
+                    string Dist(double v)
+                    {
+                        string sign = v >= 0 ? "+" : "-";
+                        v = Math.Abs(v);
+                        return sign + v.ToString("000.0000", CultureInfo.InvariantCulture);
+                    }
 
-                    double t1 = rnd.NextDouble() * 10 - 5 + 22.4;
-                    double t2 = rnd.NextDouble() * 10 - 5 + 22.3;
-                    double t3 = rnd.NextDouble() * 10 - 5 + 22.5;
-                    double t4 = rnd.NextDouble() * 0.2 - 0.1;
-                    double t5 = rnd.NextDouble() * 0.2 - 0.1;
-                    double t6 = rnd.NextDouble() * 0.2 - 0.1;
-                    double x1 = rnd.NextDouble() * 0.5 - 0.25;
-                    double x2 = rnd.NextDouble() * 0.5 - 0.25;
+                    double t1 = 20.80 + (rnd.NextDouble() - 0.5) * 0.2;
+                    double t2 = 20.84 + (rnd.NextDouble() - 0.5) * 0.2;
+                    double t3 = 21.09 + (rnd.NextDouble() - 0.5) * 0.2;
+                    double t4 = 0.05 + (rnd.NextDouble() - 0.5) * 0.02;
+                    double t5 = 0.05 + (rnd.NextDouble() - 0.5) * 0.02;
+                    double t6 = 0.00 + (rnd.NextDouble() - 0.5) * 0.02;
 
-                    string raw = "089" + Temp(t1) + Temp(t2) + Temp(t3) + Temp(t4) + Temp(t5) + Temp(t6)
-                                 + Dist(x1) + Dist(x2) + "980.";
-                    // Pump it through the same parser path
+                    double x1 = (rnd.NextDouble() - 0.5) * 200;
+                    double x2 = (rnd.NextDouble() - 0.5) * 200;
+
+                    string raw = "089"
+                                 + Temp2(t1) + Temp2(t2) + Temp2(t3) + Temp2(t4) + Temp2(t5) + Temp7(t6)
+                                 + Dist(x1) + Dist(x2)
+                                 + "980";
+
                     lock (_buf)
                     {
-                        _buf.Append(raw);
+                        _buf.Append(raw + "\r\n");
                         ExtractFramesFromBuffer();
                     }
-                    await Task.Delay(1000, token); // 1 Hz
+                    await Task.Delay(1000, token);
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    AppLogger.LogException("SimulatedLoop", ex);
+                }
             }
         }, token);
     }
@@ -1392,7 +1421,6 @@ public sealed record LoggerLive(string Id, string Port, DateTime Ts, string[] Te
 
 public sealed class AppSettings
 {
-    public List<LoggerConfig> Loggers { get; set; } = new();
     public string? DefaultFolder { get; set; }
 
     private static string AppDir =>
