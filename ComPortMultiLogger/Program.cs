@@ -65,10 +65,16 @@ public static class Defaults
     public const string BaseFolder = @"C:\BaSyTec\Drivers\OSI\";
     public const string FixedFileName = "do_not_delete.txt";
     public const int FixedBaud = 9600;
-    public const string AppVersion = "v1.0.5";
+    public const string AppVersion = "v1.0.8";
 
     // Disk guard (bytes)
     public const long MinFreeBytes = 200L * 1024L * 1024L; // 200 MB
+
+    // Reconnect idle threshold (seconds). App waits at least this long without frames before reconnect.
+    public const int ReconnectIdleSeconds = 20;
+
+    // Cooldown between reconnect requests per logger (seconds) to avoid reconnect storms.
+    public const int ReconnectRequestCooldownSeconds = 5;
 
     // Fallback white PNG (64x64) as Base64 if Assets\logo.png is missing.
     public const string LogoBase64 =
@@ -195,7 +201,8 @@ public sealed class MainForm : Form
         Dock = DockStyle.Fill,
         FullRowSelect = true,
         GridLines = true,
-        View = View.Details
+        View = View.Details,
+        HideSelection = true
     };
 
     // Control buttons
@@ -262,6 +269,11 @@ public sealed class MainForm : Form
     // Active loggers
     private readonly Dictionary<string, ComLogger> loggers = new();
 
+    // Device change / port snapshot
+    private const int WM_DEVICECHANGE = 0x0219;
+    private const int DBT_DEVNODES_CHANGED = 0x0007;
+    private string[] _lastPortSnapshot = Array.Empty<string>();
+
     public MainForm()
     {
         Text = "M81 DataTransfer";
@@ -303,7 +315,7 @@ public sealed class MainForm : Form
             Padding = new Padding(20),
             BackColor = Color.FromArgb(40, 40, 40)
         };
-        lblTitle.Text = "M81 Data Transfer";
+        lblTitle.Text = "M81 DataTransfer";
         lblTitle.Font = new Font("Segoe UI", 24, FontStyle.Bold);
         lblTitle.ForeColor = Color.White;
 
@@ -335,25 +347,13 @@ public sealed class MainForm : Form
         lv.Columns.Add("Status", 260);           // 2
         lv.Columns.Add("Letzter Fehler", 360);   // 3
         lv.Columns.Add("Age", 80);               // 4
-
         TryEnableDoubleBuffer(lv);
-        TryEnableDoubleBuffer(dgvLive);
 
         // Split container
         split.Panel1.Controls.Add(lv);
-        split.Panel2.Controls.Add(dgvLive);
-
-        // ===== Buttons
-        var pnlButtons = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Bottom,
-            Height = 60,
-            FlowDirection = FlowDirection.LeftToRight,
-            Padding = new Padding(12)
-        };
-        pnlButtons.Controls.AddRange(new Control[] { btnStart, btnStop, btnRemove, btnOpenFolder, btnClearLive });
 
         // ===== Live Grid columns (one row per COM, updated)
+        TryEnableDoubleBuffer(dgvLive);
         dgvLive.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Zeit", Name = "Time", FillWeight = 120 });
         dgvLive.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "COM", Name = "COM", FillWeight = 80 });
         dgvLive.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "T1", Name = "T1" });
@@ -378,9 +378,21 @@ public sealed class MainForm : Form
             }
         };
 
-        // ===== Footer (status)
+        split.Panel2.Controls.Add(dgvLive);
+
+        // ===== Buttons
+        var pnlButtons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Bottom,
+            Height = 60,
+            FlowDirection = FlowDirection.LeftToRight,
+            Padding = new Padding(12)
+        };
+        pnlButtons.Controls.AddRange(new Control[] { btnStart, btnStop, btnRemove, btnOpenFolder, btnClearLive });
+
+        // ===== Footer (status) – include reconnect duration
         slVersion.Text = $"Version {Defaults.AppVersion}";
-        slNotes.Text = $"Baudrate: {Defaults.FixedBaud} • Dateiname: {Defaults.FixedFileName}";
+        slNotes.Text = $"Baudrate: {Defaults.FixedBaud} • Dateiname: {Defaults.FixedFileName} • Reconnect nach: {Defaults.ReconnectIdleSeconds}s Idle";
         slState.Text = "Bereit";
         status.Items.AddRange(new ToolStripItem[] { slVersion, slNotes, slState });
 
@@ -411,7 +423,7 @@ public sealed class MainForm : Form
             try
             {
                 foreach (var lg in loggers.Values) lg.Dispose();
-                // On next start the selected COMs shall be empty:
+                // On next start selected COMs shall be empty:
                 AppSettings.Save(new AppSettings { DefaultFolder = NormalizeFolder(txtFolder.Text) });
             }
             catch { }
@@ -422,6 +434,9 @@ public sealed class MainForm : Form
         RefreshPorts();
         txtFolder.Text = NormalizeFolder(settings.DefaultFolder ?? Defaults.BaseFolder);
         UpdateButtons();
+
+        // Port snapshot
+        _lastPortSnapshot = SerialPort.GetPortNames().OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToArray();
 
         // Originalfarben merken (für Warnmodus)
         _origFormBack = this.BackColor;
@@ -444,6 +459,47 @@ public sealed class MainForm : Form
         // Watchdog: update Age column and auto-reconnect on inactivity/unplug
         _watchdogTimer.Tick += (_, __) => WatchdogScan();
         _watchdogTimer.Start();
+    }
+
+    // ----- WM_DEVICECHANGE to detect USB serial arrival/removal -----
+    protected override void WndProc(ref Message m)
+    {
+        base.WndProc(ref m);
+
+        if (m.Msg == WM_DEVICECHANGE && (int)m.WParam == DBT_DEVNODES_CHANGED)
+        {
+            try
+            {
+                var now = SerialPort.GetPortNames().OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToArray();
+                var before = _lastPortSnapshot;
+                _lastPortSnapshot = now;
+
+                AppLogger.Debug("WM_DEVICECHANGE: ports now = " + string.Join(",", now));
+
+                // refresh combo
+                cmbPorts.Items.Clear();
+                cmbPorts.Items.AddRange(now);
+                if (cmbPorts.Items.Count > 0 && cmbPorts.SelectedIndex < 0) cmbPorts.SelectedIndex = 0;
+
+                // nudge running loggers only when state changed for their port
+                foreach (ListViewItem it in lv.Items)
+                {
+                    if (it.Tag is ComLogger lg && lg.IsRunning)
+                    {
+                        bool existsNow = now.Contains(lg.Config.PortName, StringComparer.OrdinalIgnoreCase);
+                        bool existedBefore = before.Contains(lg.Config.PortName, StringComparer.OrdinalIgnoreCase);
+                        if (existsNow != existedBefore)
+                        {
+                            lg.RequestReconnect(existsNow ? "device_arrival" : "device_removed");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                AppLogger.LogException("WM_DEVICECHANGE", ex);
+            }
+        }
     }
 
     private static void TryEnableDoubleBuffer(Control c)
@@ -560,7 +616,13 @@ public sealed class MainForm : Form
             return;
         }
 
-        var cfg = new LoggerConfig { PortName = port, FolderPath = folder, Simulated = simulated };
+        var cfg = new LoggerConfig
+        {
+            PortName = port,
+            FolderPath = folder,
+            Simulated = simulated,
+            AutoRebind = true
+        };
 
         var logger = new ComLogger(port, cfg); // use port as Id now
         logger.StatusChanged += OnLoggerStatus;
@@ -583,7 +645,7 @@ public sealed class MainForm : Form
         lv.SelectedItems.Clear();
         item.Selected = true;
 
-        // Create or get live row for this port
+        // Create or get live row for this port (single row per port)
         EnsureLiveRowForPort(cfg.PortName);
 
         slState.Text = simulated ? $"Sim-Port {port} hinzugefügt" : $"Port {port} hinzugefügt";
@@ -599,7 +661,7 @@ public sealed class MainForm : Form
         row = dgvLive.Rows[idx];
         var color = GetSoftColorForPort(port);
         row.DefaultCellStyle.BackColor = color;
-        row.DefaultCellStyle.SelectionBackColor = color;
+        row.DefaultCellStyle.SelectionBackColor = row.DefaultCellStyle.BackColor;
         row.DefaultCellStyle.SelectionForeColor = dgvLive.DefaultCellStyle.ForeColor;
         _liveRowsByPort[port] = row;
         btnClearLive.Enabled = dgvLive.Rows.Count > 0;
@@ -676,8 +738,8 @@ public sealed class MainForm : Form
 
                 it.SubItems[4].Text = double.IsNaN(ageSec) ? "-" : $"{ageSec:0.0}s";
 
-                // Inactivity/unplug threshold → force reconnect loop
-                if (lg.IsRunning && (double.IsNaN(ageSec) || ageSec >= 3.0))
+                // If running and idle ≥ threshold → request reconnect (throttled inside logger)
+                if (lg.IsRunning && (!double.IsNaN(ageSec) && ageSec >= Defaults.ReconnectIdleSeconds))
                 {
                     var sub = it.SubItems[2]; // Status column
                     sub.ForeColor = Color.DarkOrange;
@@ -894,8 +956,9 @@ public sealed class ComLogger : IDisposable
     private CancellationTokenSource? _cts;
     private int _reconnectAttempt;
     private bool _reconnectLoopRunning;
+    private DateTime _nextReconnectAllowedUtc = DateTime.MinValue; // throttle
     private readonly WinFormsTimer _rateTimer = new() { Interval = 1000 };
-    private readonly WinFormsTimer _idleTimer = new() { Interval = 3000 }; // auto-reopen if idle
+    private readonly WinFormsTimer _idleTimer = new() { Interval = Defaults.ReconnectIdleSeconds * 1000 }; // 20s idle
     private int _linesThisSecond = 0;
 
     // For simulation mode
@@ -903,6 +966,7 @@ public sealed class ComLogger : IDisposable
     private bool _simTaskRunning;
 
     // Strict frame (terminator "980" without dot)
+    // Pattern: 089 + t1..t5 [±dd.dd] + t6 [±dd.ddddddd] + x1,x2 [±ddd.dddd] + 980
     private static readonly Regex FrameRegex = new(
         @"^089" +
         @"(?<t1>[+-]\d{2}\.\d{2})" +
@@ -954,13 +1018,13 @@ public sealed class ComLogger : IDisposable
         };
         _rateTimer.Start();
 
-        // Idle timer: if no frames for a while, try reconnect
+        // Idle timer: if no frames for a while, try reconnect (20s)
         _idleTimer.Tick += (_, __) =>
         {
             if (!IsRunning || Config.Simulated) return;
             var last = LastFrameUtc;
             var age = last == DateTime.MinValue ? TimeSpan.MaxValue : DateTime.UtcNow - last;
-            if (age.TotalSeconds >= 3)
+            if (age.TotalSeconds >= Defaults.ReconnectIdleSeconds)
             {
                 AppLogger.Debug($"IdleTimer: no data for {age.TotalSeconds:0.0}s on {Config.PortName}, requesting reconnect");
                 RequestReconnect("idle_timer");
@@ -1030,6 +1094,8 @@ public sealed class ComLogger : IDisposable
             {
                 if (_serial != null)
                 {
+                    _serial.ErrorReceived -= SerialOnError;
+                    _serial.PinChanged -= SerialOnPinChanged;
                     _serial.DataReceived -= SerialOnDataReceived;
                     if (_serial.IsOpen) _serial.Close();
                     _serial.Dispose();
@@ -1061,18 +1127,52 @@ public sealed class ComLogger : IDisposable
                 ReadTimeout = 100,
                 WriteTimeout = 500,
                 NewLine = "\n",
-                Encoding = Encoding.UTF8
+                Encoding = Encoding.UTF8,
+                DtrEnable = true,
+                RtsEnable = true
             };
             sp.DataReceived += SerialOnDataReceived;
+            sp.ErrorReceived += SerialOnError;
+            sp.PinChanged += SerialOnPinChanged;
             sp.Open();
             _serial = sp;
             AppLogger.Log($"Serial opened: {Config.PortName} @ {Defaults.FixedBaud}");
         }
     }
 
+    private void SerialOnError(object? s, SerialErrorReceivedEventArgs e)
+    {
+        AppLogger.Log($"Serial error on {Config.PortName}: {e.EventType}");
+        RequestReconnect("serial_error_" + e.EventType);
+    }
+
+    private void SerialOnPinChanged(object? s, SerialPinChangedEventArgs e)
+    {
+        AppLogger.Log($"Pin changed on {Config.PortName}: {e.EventType}");
+        if (e.EventType == SerialPinChange.Break || e.EventType == SerialPinChange.CDChanged ||
+            e.EventType == SerialPinChange.DsrChanged || e.EventType == SerialPinChange.CtsChanged)
+        {
+            RequestReconnect("pin_change_" + e.EventType);
+        }
+    }
+
     public void RequestReconnect(string reason)
     {
-        if (_reconnectLoopRunning) return;
+        // throttle reconnect requests so they don't fire too often/early
+        var nowUtc = DateTime.UtcNow;
+        if (nowUtc < _nextReconnectAllowedUtc)
+        {
+            AppLogger.Debug($"Reconnect suppressed (cooldown) on {Config.PortName}, reason={reason}");
+            return;
+        }
+        _nextReconnectAllowedUtc = nowUtc.AddSeconds(Defaults.ReconnectRequestCooldownSeconds);
+
+        if (_reconnectLoopRunning)
+        {
+            AppLogger.Debug($"Reconnect already running on {Config.PortName}, reason={reason}");
+            return;
+        }
+
         _reconnectLoopRunning = true;
         _cts ??= new CancellationTokenSource();
 
@@ -1081,15 +1181,19 @@ public sealed class ComLogger : IDisposable
             try
             {
                 AppLogger.Debug($"Reconnect loop begin: port={Config.PortName}, reason={reason}");
+                string? lastTried = null;
+
                 while (!_cts.IsCancellationRequested)
                 {
                     try
                     {
-                        // ensure fully closed
+                        // fully close
                         lock (_serialLock)
                         {
                             if (_serial != null)
                             {
+                                _serial.ErrorReceived -= SerialOnError;
+                                _serial.PinChanged -= SerialOnPinChanged;
                                 _serial.DataReceived -= SerialOnDataReceived;
                                 if (_serial.IsOpen) _serial.Close();
                                 _serial.Dispose();
@@ -1098,17 +1202,61 @@ public sealed class ComLogger : IDisposable
                         }
 
                         var ports = SerialPort.GetPortNames();
-                        if (!ports.Contains(Config.PortName, StringComparer.OrdinalIgnoreCase))
+                        string? target = null;
+
+                        if (ports.Contains(Config.PortName, StringComparer.OrdinalIgnoreCase))
                         {
-                            RaiseStatus($"Warte auf Gerät – {Config.PortName}", "Port fehlt");
+                            target = Config.PortName;
                         }
-                        else
+                        else if (Config.AutoRebind && ports.Length > 0)
                         {
-                            OpenSerial();
+                            // Heuristic: choose first available by name order
+                            target = ports.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).First();
+                            if (!string.Equals(target, Config.PortName, StringComparison.OrdinalIgnoreCase))
+                                AppLogger.Log($"AutoRebind: {Config.PortName} not found; trying {target}");
+                        }
+
+                        if (target != null)
+                        {
+                            // Try open
+                            lock (_serialLock)
+                            {
+                                var sp = new SerialPort(target, Defaults.FixedBaud)
+                                {
+                                    Parity = Parity.None,
+                                    DataBits = 8,
+                                    StopBits = StopBits.One,
+                                    Handshake = Handshake.None,
+                                    ReadTimeout = 100,
+                                    WriteTimeout = 500,
+                                    NewLine = "\n",
+                                    Encoding = Encoding.UTF8,
+                                    DtrEnable = true,
+                                    RtsEnable = true
+                                };
+                                sp.DataReceived += SerialOnDataReceived;
+                                sp.ErrorReceived += SerialOnError;
+                                sp.PinChanged += SerialOnPinChanged;
+                                sp.Open();
+                                _serial = sp;
+                            }
+
+                            if (!string.Equals(target, Config.PortName, StringComparison.OrdinalIgnoreCase))
+                                Config.PortName = target; // rebind to new COM number
+
                             _reconnectAttempt = 0;
                             RaiseStatus($"Wieder verbunden – {Config.PortName} @ {Defaults.FixedBaud}.");
+                            AppLogger.Log($"Serial reopened: {Config.PortName}");
                             _reconnectLoopRunning = false;
                             return;
+                        }
+
+                        // Still no suitable port
+                        string joined = string.Join(",", ports);
+                        if (lastTried != joined)
+                        {
+                            AppLogger.Debug("Reconnect waiting: no suitable COM port yet. Available: " + joined);
+                            lastTried = joined;
                         }
                     }
                     catch (Exception ex)
@@ -1344,7 +1492,7 @@ public sealed class ComLogger : IDisposable
         StatusChanged?.Invoke(this, new LoggerStatus(Id, text, lastError));
     }
 
-    // Simulation mode
+    // Simulation mode (valid frames @ 1 Hz)
     private void StartSimulated()
     {
         _simTaskRunning = true;
@@ -1369,7 +1517,7 @@ public sealed class ComLogger : IDisposable
                     {
                         string sign = v >= 0 ? "+" : "-";
                         v = Math.Abs(v);
-                        return sign + v.ToString("000.0000", CultureInfo.InvariantCulture);
+                        return sign + v.ToString("000.0004".Replace('4', '0'), CultureInfo.InvariantCulture); // keep 4 decimals
                     }
 
                     double t1 = 20.80 + (rnd.NextDouble() - 0.5) * 0.2;
@@ -1382,9 +1530,17 @@ public sealed class ComLogger : IDisposable
                     double x1 = (rnd.NextDouble() - 0.5) * 200;
                     double x2 = (rnd.NextDouble() - 0.5) * 200;
 
+                    // Dist formatting helper corrected:
+                    string Dist4(double v)
+                    {
+                        string sign = v >= 0 ? "+" : "-";
+                        v = Math.Abs(v);
+                        return sign + v.ToString("000.0000", CultureInfo.InvariantCulture);
+                    }
+
                     string raw = "089"
                                  + Temp2(t1) + Temp2(t2) + Temp2(t3) + Temp2(t4) + Temp2(t5) + Temp7(t6)
-                                 + Dist(x1) + Dist(x2)
+                                 + Dist4(x1) + Dist4(x2)
                                  + "980";
 
                     lock (_buf)
@@ -1410,6 +1566,7 @@ public sealed record LoggerConfig
     public string FolderPath { get; set; } =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "ComPortLogger");
     public bool Simulated { get; set; } = false;
+    public bool AutoRebind { get; set; } = true;
 
     public string OutputPath => Path.Combine(FolderPath, Defaults.FixedFileName);
 }
