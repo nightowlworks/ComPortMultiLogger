@@ -1,7 +1,12 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 	<ItemGroup>
-  <PackageReference Include="System.IO.Ports" Version="8.0.0" />
-</ItemGroup>
+      <PackageReference Include="System.IO.Ports" Version="8.0.0" />
+    </ItemGroup>
+	<ItemGroup>
+		<Content Include="Assets\logo.png">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+	</ItemGroup>
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>   <!-- wichtig: -windows -->
