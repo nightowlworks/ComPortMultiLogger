@@ -3,15 +3,18 @@
       <PackageReference Include="System.IO.Ports" Version="8.0.0" />
     </ItemGroup>
 	<ItemGroup>
+		<Content Include="Assets\appicon2.ico" />
 		<Content Include="Assets\logo.png">
 			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 		</Content>
 	</ItemGroup>
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>   <!-- wichtig: -windows -->
-    <UseWindowsForms>true</UseWindowsForms>
+	  <TargetFrameworks>net8.0-windows</TargetFrameworks>
+	  <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <ApplicationIcon>Assets\appicon2.ico</ApplicationIcon>
+    <StartupObject>Program</StartupObject>
   </PropertyGroup>
 </Project>
